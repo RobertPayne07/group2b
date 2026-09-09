@@ -17,7 +17,7 @@ Headline finding
 Key numbers for KPI cards
 KPI	Value
 Average Wait Time (clinic-wide)	106.3 minutes
-Longest-Wait Department	Department 7 (107.7 min)
+Longest-Wait Department,Department 7 (107.7 min)
 Longest-Wait Visit Type	Emergency (106.9 min) — but see Unknown-type caveat below
 Total Visits (cleaned, de-duplicated)	25,000
 Raw records before cleaning	25,100 (label explicitly as "raw" if shown at all)
