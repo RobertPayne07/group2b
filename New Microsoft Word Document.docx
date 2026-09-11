@@ -1,60 +1,102 @@
-Data Quality Notes — Clinic Visits Dataset
-Source file: `Clinic_Visits.xlsx` (single sheet, 25,100 rows, 9 columns)
-Business question: Which departments have the longest patient wait times, and how does that vary by visit type and over time?
-Principle followed throughout: issues are documented and flagged, not silently fixed or guessed at. Nothing is imputed; rows are only excluded from a specific measure when a value is genuinely impossible for that measure.
-0. Raw column inventory
-Column	Type observed	Notes
-`#`	int	Sequential spreadsheet row number, 1–25,100. Not a business key — dropped from the model.
-`visit_id`	int	Intended primary key of a visit. Not unique in the raw file (see §1).
-`visit_date`	mixed	Stored as Excel datetime for most rows, as `DD/MM/YYYY` text for others (see §2).
-`patient_id`	int	Expected range 1–900 per project scope; 62 rows fall outside it (see §4).
-`doctor_id`	int	Range 1–40, fully populated, no blanks.
-`department_id`	int	Range 1–8, fully populated, no blanks.
-`visit_type`	string	Free-text category with case, whitespace and missing-value inconsistency (see §3).
-`wait_minutes`	int	Includes physically impossible negative values (see §5).
-`consultation_fee`	int	Values ∈ {0, 20, 35, 50, 80, 120}. No blanks; fee = 0 occurs at a similar ~35% rate in every department and every visit type, so it looks like a legitimate fee tier (e.g. a covered/waived visit) rather than a missing-value placeholder — flagged as an assumption to confirm with the business, not treated as an error.
-No dimension/master files (patient roster, doctor roster, department names) were supplied with this dataset — only the fact-level extract. Everywhere the assignment brief calls for orphan-key checks against `DimPatient`/`DimDoctor`/`DimDepartment`, this notebook substitutes a range/plausibility check against the extract itself and states that explicitly as a limitation, rather than reporting a false "0 orphans found."
-1. Duplicate visits
-100 rows (50 pairs) share a `visit_id` with another row, and in every one of those 50 pairs all other columns are identical too — same patient, doctor, department, date, visit type, wait time and fee. This is consistent with a row being loaded twice, not with two genuinely different visits colliding on an ID.
-Treatment: kept the first occurrence of each `visit_id`, dropped the repeat. 25,100 raw rows → 25,000 unique visits. The 100 dropped rows are logged in `audit_duplicate_visit_id.csv` for auditability.
-Not investigated further: duplicate patients or duplicate doctors — there is no patient/doctor master table in this extract to check against, so this check could not be performed as scoped.
-2. Visit date format
-24,137 rows store `visit_date` as a proper Excel datetime.
-963 rows store it as a `DD/MM/YYYY` text string (e.g. `"29/07/2024"`) instead.
-Both forms parse cleanly once the text form is read with an explicit `%d/%m/%Y` format — 0 rows failed to parse, and there are no impossible dates (no Feb-30, no future-dated visits, etc.).
-Range after parsing: 1 Jan 2024 → 30 Dec 2025 (used to size `DimDate`).
-Treatment: both formats coerced to a single `datetime64` column before anything else runs. This must happen before de-duplication/joins, because a text date and a datetime date for the same real date are not naturally equal without parsing.
-3. Inconsistent / missing `visit_type`
-Thirteen distinct raw spellings collapse to three real categories plus a genuine "unknown":
-Raw values	Standardised to
-`Outpatient`, `OUTPATIENT`, `outpatient`, ` Outpatient`	Outpatient
-`Follow-up`, `FOLLOW-UP`, `follow-up`, ` Follow-up`	Follow-up
-`Emergency`, `EMERGENCY`, `emergency`, ` Emergency`	Emergency
-`[NULL]` (literal text, 1,508 rows / 6.0%)	Unknown
-Treatment: case-fold + trim, then map to the three canonical labels. The `[NULL]` rows are not guessed into one of the three real categories — they become their own `Unknown` member of `DimVisitType`. This keeps the 1,508 visits visible and countable (Total Visits still reconciles to 25,000) while making clear in every visit-type breakdown that ~6% of visits have no reliable type on record, rather than quietly inflating whichever category they were assigned to.
-4. Patient IDs outside the expected range
-The project scope describes 900 patients. 24,938 rows have `patient_id` in the expected 1–900 range.
-62 rows have `patient_id` between 90,000 and 90,061 — a distinct, contiguous, clearly-deliberate block, not noise (e.g. not 901, 1500, 2 million). This pattern is typical of a walk-in / unregistered-patient placeholder range rather than a data-entry error.
-Treatment: flagged with `IsRegisteredPatient = FALSE` rather than deleted or remapped into the 1–900 range. This is an assumption pending confirmation from whoever owns the patient master data — it should be validated once/if a real patient dimension file is available, and the notes here should not be read as certainty.
-5. Negative wait times
-51 rows (0.2%) have `wait_minutes < 0`, ranging from ‑3 to ‑209 minutes. A wait time cannot be negative.
-The magnitudes mirror the plausible positive range (0–209), consistent with a sign flip during entry/export rather than a different kind of error.
-Treatment: flagged with `IsValidWait = FALSE` and excluded only from wait-time measures (average/median/max wait). The visits themselves are not deleted from the fact table — they still count toward Total Visits, fee totals, etc. Deleting the whole row would understate visit volume for a problem that only affects one column.
-6. Fields with no data-quality issues found
-`department_id`, `doctor_id`: fully populated, entirely within their expected ranges (1–8 and 1–40), no blanks, no out-of-range values.
-`consultation_fee`: no blanks, all values fall into one of six discrete tiers.
-7. Cleaned analytical population
-Population	Row count	Used for
-Raw rows in source file	25,100	Reference only — should never be shown on the dashboard as "records analysed"
-Unique visits (after de-dup)	25,000	`Total Visits`
-Unique visits with a valid (non-negative) wait time	24,950	`Average Wait Time`, department ranking, trend
-…of which, visit type is known (not `Unknown`)	23,450	Visit-type breakdown and Department × Visit Type views
-The dashboard's headline Total Visits card should read 25,000, not 25,100 — and should be labelled clearly enough that a duplicate-inflated raw count is never quoted as the analysed population.
-8. Summary of treatments (for the audit trail)
-Issue	Rows affected	Treatment	Deleted?
-Duplicate `visit_id`	100 (50 pairs)	Kept first occurrence	Yes, the repeat only
-Text-format dates	963	Parsed to datetime	No
-Inconsistent `visit_type` spelling	~11,000+	Standardised to 3 labels	No
-Missing `visit_type` (`[NULL]`)	1,508	Mapped to explicit `Unknown` member	No
-Negative `wait_minutes`	51	Flagged `IsValidWait = FALSE`, excluded from wait measures only	No
-`patient_id` outside 1–900	62	Flagged `IsRegisteredPatient = FALSE`	No
+# Data Quality Notes — Group 2b: Clinic Visits
+
+Source: `raw_clinic` (read-only, PostgreSQL). These are profiling findings only — no fixes applied here. Cleaning decisions happen in week 3.
+
+**Status key:**Confirmed (quantified on full table) · Observed in a sample, needs full-table count.
+
+---
+
+## Table: `visits` (~25,100 rows)
+
+### 1. Inconsistent `visit_date` formats — 
+At least four formats seen in a ~250-row sample: `YYYY-MM-DD`, `YYYY/MM/DD`, `DD-Mon-YYYY` (e.g. `06-Oct-2024`), `DD/MM/YYYY` (e.g. `29/07/2024`). Rows where the first slash-separated number exceeds 12 confirm that format is day/month/year, not month/day.
+```sql
+SELECT visit_date, count(*) FROM raw_clinic.visits
+WHERE visit_date !~ '^\d{4}-\d{2}-\d{2}$'
+GROUP BY visit_date ORDER BY count(*) DESC;
+```
+Count on full table: ___
+
+### 2. Missing `visit_type` 
+Blank values observed in the sample (~10 of ~250 rows).
+```sql
+SELECT count(*) FROM raw_clinic.visits WHERE visit_type IS NULL OR trim(visit_type) = '';
+```
+Count on full table: ___
+
+### 3. Inconsistent `visit_type` spelling/casing/whitespace 
+Same three categories appear as e.g. `Outpatient`, `OUTPATIENT`, `outpatient`, `  Outpatient  `. Same pattern for Follow-up and Emergency variants.
+```sql
+SELECT visit_type, count(*) FROM raw_clinic.visits GROUP BY visit_type ORDER BY count(*) DESC;
+```
+Distinct raw values on full table: ___
+
+### 4. Implausible `patient_id` values —
+Two values in the sample (90000, 90042) exceed the 900-row range of `patients` — likely a data-entry error (extra digit).
+```sql
+SELECT v.patient_id, count(*) FROM raw_clinic.visits v
+LEFT JOIN raw_clinic.patients p ON v.patient_id = p.patient_id
+WHERE p.patient_id IS NULL GROUP BY v.patient_id;
+```
+Orphan patient_ids found: ___
+
+### 5. Orphan `doctor_id` references 
+```sql
+SELECT v.doctor_id, count(*) FROM raw_clinic.visits v
+LEFT JOIN raw_clinic.doctors d ON v.doctor_id = d.doctor_id
+WHERE d.doctor_id IS NULL GROUP BY v.doctor_id;
+```
+
+### 6. Orphan `department_id` references 
+```sql
+SELECT v.department_id, count(*) FROM raw_clinic.visits v
+LEFT JOIN raw_clinic.departments dep ON v.department_id = dep.department_id
+WHERE dep.department_id IS NULL GROUP BY v.department_id;
+```
+
+### 7. Duplicate visits
+```sql
+SELECT patient_id, doctor_id, visit_date, count(*)
+FROM raw_clinic.visits
+GROUP BY patient_id, doctor_id, visit_date
+HAVING count(*) > 1;
+```
+
+### 8. `wait_minutes` / `fee` outliers 
+Check for negative values and extreme highs/lows. Decide whether `fee = 0` is a real waiver or a data gap (don't decide yet — just note the split).
+```sql
+SELECT min(wait_minutes), max(wait_minutes), min(fee), max(fee) FROM raw_clinic.visits;
+```
+
+### 9. Visit's `department_id` disagrees with the doctor's actual department 
+A subtler consistency bug — worth checking even though it's not a missing or malformed value.
+```sql
+SELECT v.visit_id, v.department_id AS visit_dept, d.department_id AS doctor_dept
+FROM raw_clinic.visits v
+JOIN raw_clinic.doctors d ON v.doctor_id = d.doctor_id
+WHERE v.department_id <> d.department_id;
+```
+
+---
+
+## Table: `patients` (~900 rows)
+- ☐ `birth_year` plausibility (future years, ages over ~110)
+- ☐ `sex` value consistency (`M`/`F` vs `Male`/`Female` mixed?)
+- ☐ `region` / `insurance_scheme` spelling consistency
+- ☐ Duplicate patient records
+
+## Table: `doctors` (~40 rows)
+- ☐ Orphan `department_id` (doctor assigned to a department that doesn't exist)
+- ☐ `years_experience` validity (negative or implausibly high)
+- ☐ Duplicate doctor records
+
+## Table: `departments` (8 rows)
+- ☐ Duplicate department names
+- ☐ Blank/missing `floor` values
+
+---
+
+## Next steps
+1. Run each query above against the full tables, fill in the counts, flip status.
+2. Pull a sample from `patients`, `doctors`, and `departments` (same way as `visits`) to catch anything these queries miss.
+3. Don't fix anything yet — week 3 is cleaning. This file is the evidence trail that decision-making leans on.
