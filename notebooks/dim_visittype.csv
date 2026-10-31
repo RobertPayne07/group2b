@@ -1,0 +1,5 @@
+VisitTypeKey,VisitType
+1,Outpatient
+2,Follow-up
+3,Emergency
+4,Unknown
